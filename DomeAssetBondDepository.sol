@@ -584,14 +584,42 @@ library FixedPoint {
     }
 }
 
-interface ITreasury {
-    function deposit( uint _amount, address _token, uint _profit ) external returns ( bool );
-    function tokenValue( address _token, uint _amount ) external view returns ( uint value_ );
+interface AggregatorV3Interface {
+
+  function decimals() external view returns (uint8);
+  function description() external view returns (string memory);
+  function version() external view returns (uint256);
+
+  // getRoundData and latestRoundData should both raise "No data present"
+  // if they do not have data to report, instead of returning unset values
+  // which could be misinterpreted as actual reported values.
+  function getRoundData(uint80 _roundId)
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+  function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
 }
 
-interface IBondCalculator {
-    function valuation( address _LP, uint _amount ) external view returns ( uint );
-    function markdown( address _LP ) external view returns ( uint );
+interface ITreasury {
+    function deposit( uint _amount, address _token, uint _profit ) external returns ( bool );
+    function valueOf( address _token, uint _amount ) external view returns ( uint value_ );
+    function mintRewards( address _recipient, uint _amount ) external;
+    function totalReserves() external view returns(uint);
 }
 
 interface IStaking {
@@ -602,7 +630,7 @@ interface IStakingHelper {
     function stake( uint _amount, address _recipient ) external;
 }
 
-contract DomeBondDepository is Ownable {
+contract DomeAssetBondDepository is Ownable {
 
     using FixedPoint for *;
     using SafeERC20 for IERC20;
@@ -628,8 +656,7 @@ contract DomeBondDepository is Ownable {
     address public immutable treasury; // mints DOME when receives principle
     address public immutable DAO; // receives profit share from bond
 
-    bool public immutable isLiquidityBond; // LP and Reserve bonds are treated slightly different
-    address public immutable bondCalculator; // calculates value of LP tokens
+    AggregatorV3Interface internal priceFeed;
 
     address public staking; // to auto-stake payout
     address public stakingHelper; // to stake and claim if no staking warmup
@@ -644,9 +671,8 @@ contract DomeBondDepository is Ownable {
     uint public lastDecay; // reference block for debt decay
 
     uint public totalPrinciple; // total principle bonded through this depository
-    
     string internal name_; //name of this bond
-
+    uint public maxWeight;
 
     /* ======== STRUCTS ======== */
 
@@ -654,9 +680,9 @@ contract DomeBondDepository is Ownable {
     struct Terms {
         uint controlVariable; // scaling variable for price
         uint vestingTerm; // in blocks
-        uint minimumPrice; // vs principle value
+        uint minimumPrice; // vs principle value. 4 decimals (1500 = 0.15)
         uint maxPayout; // in thousandths of a %. i.e. 500 = 0.5%
-        uint fee; // as % of bond payout, in hundreths. ( 500 = 5% = 0.05 for every 1 paid)
+        uint fee; // never used, for compatibility
         uint maxDebt; // 9 decimal debt ratio, max % total supply created as debt
     }
 
@@ -687,8 +713,8 @@ contract DomeBondDepository is Ownable {
         address _DOME,
         address _principle,
         address _treasury, 
-        address _DAO, 
-        address _bondCalculator
+        address _DAO,
+        address _feed
     ) {
         require( _DOME != address(0) );
         DOME = _DOME;
@@ -698,14 +724,14 @@ contract DomeBondDepository is Ownable {
         treasury = _treasury;
         require( _DAO != address(0) );
         DAO = _DAO;
-        // bondCalculator should be address(0) if not LP bond
-        bondCalculator = _bondCalculator;
-        isLiquidityBond = ( _bondCalculator != address(0) );
+        require( _feed != address(0) );
+        priceFeed = AggregatorV3Interface( _feed );
         name_ = _name;
+        maxWeight=500;
     }
 
     /**
-     *  @notice initializes bond parameters
+     *  @notice initializes bond parameters, fee is no use just for compatibility
      *  @param _controlVariable uint
      *  @param _vestingTerm uint
      *  @param _minimumPrice uint
@@ -753,11 +779,11 @@ contract DomeBondDepository is Ownable {
         } else if ( _parameter == PARAMETER.PAYOUT ) { // 1
             require( _input <= 1000, "Payout cannot be above 1 percent" );
             terms.maxPayout = _input;
-        } else if ( _parameter == PARAMETER.FEE ) { // 2
+        } else if ( _parameter == PARAMETER.FEE ) { // 2 not in use
             require( _input <= 10000, "DAO fee cannot exceed payout" );
             terms.fee = _input;
         } else if ( _parameter == PARAMETER.DEBT ) { // 3
-            terms.maxDebt = _input;
+            terms.maxDebt = _input;	
         } else if ( _parameter == PARAMETER.MINPRICE ) { // 4
             terms.minimumPrice = _input;
         }
@@ -820,39 +846,29 @@ contract DomeBondDepository is Ownable {
     ) external returns ( uint ) {
         require( _depositor != address(0), "Invalid address" );
 
+        require(principlePercentAfterPurchase(_amount)<=maxWeight, "total value of this token too high");
+
         decayDebt();
         require( totalDebt <= terms.maxDebt, "Max capacity reached" );
-        
+       
         uint priceInUSD = bondPriceInUSD(); // Stored in bond info
         uint nativePrice = _bondPrice();
 
         require( _maxPrice >= nativePrice, "Slippage limit: more than max price" ); // slippage protection
 
-        uint value = ITreasury( treasury ).tokenValue( principle, _amount );
+        uint value = ITreasury( treasury ).valueOf( principle, _amount );
         uint payout = payoutFor( value ); // payout to bonder is computed
 
         require( payout >= 10000000, "Bond too small" ); // must be > 0.01 DOME ( underflow protection )
         require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
 
-        // profits are calculated
-        uint fee = payout.mul( terms.fee ).div( 10000 );
-        uint profit = value.sub( payout ).sub( fee );
-
         /**
-            principle is transferred in
-            approved and
-            deposited into the treasury, returning (_amount - profit) DOME
+            asset carries risk and is not minted against
+            asset transfered to treasury and rewards minted as payout
          */
-        IERC20( principle ).safeTransferFrom( msg.sender, address(this), _amount );
-        IERC20( principle ).approve( address( treasury ), _amount );
-        ITreasury( treasury ).deposit( _amount, principle, profit );
-        
+        IERC20( principle ).safeTransferFrom( msg.sender, treasury, _amount );
+        ITreasury( treasury ).mintRewards( address(this), payout );
         totalPrinciple=totalPrinciple.add(_amount);
-        
-        if ( fee != 0 ) { // fee is transferred to dao 
-            IERC20( DOME ).safeTransfer( DAO, fee ); 
-        }
-        
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
                 
@@ -980,7 +996,7 @@ contract DomeBondDepository is Ownable {
      *  @return uint
      */
     function payoutFor( uint _value ) public view returns ( uint ) {
-        return FixedPoint.fraction( _value, bondPrice() ).decode112with18().div( 1e16 );
+        return FixedPoint.fraction( _value, bondPrice() ).decode112with18().div( 1e14 );
     }
 
 
@@ -989,7 +1005,7 @@ contract DomeBondDepository is Ownable {
      *  @return price_ uint
      */
     function bondPrice() public view returns ( uint price_ ) {        
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ).div( 1e7 );
+        price_ = terms.controlVariable.mul( debtRatio() ).div( 1e5 );
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;
         }
@@ -1000,7 +1016,7 @@ contract DomeBondDepository is Ownable {
      *  @return price_ uint
      */
     function _bondPrice() internal returns ( uint price_ ) {
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ).div( 1e7 );
+        price_ = terms.controlVariable.mul( debtRatio() ).div( 1e5 );
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;        
         } else if ( terms.minimumPrice != 0 ) {
@@ -1008,16 +1024,25 @@ contract DomeBondDepository is Ownable {
         }
     }
 
+    function setMaxWeight(uint _maxWeight) external{
+        require(_maxWeight<=3000,"cant be more than 30%(3000)");
+        maxWeight=_maxWeight;
+    }
+
+    /**
+     *  @notice get asset price from chainlink
+     */
+    function assetPrice() public view returns (int) {
+        ( , int price, , , ) = priceFeed.latestRoundData();
+        return price;
+    }
+
     /**
      *  @notice converts bond price to DAI value
      *  @return price_ uint
      */
     function bondPriceInUSD() public view returns ( uint price_ ) {
-        if( isLiquidityBond ) {
-            price_ = bondPrice().mul( IBondCalculator( bondCalculator ).markdown( principle ) ).div( 100 );
-        } else {
-            price_ = bondPrice().mul( 10 ** IERC20( principle ).decimals() ).div( 100 );
-        }
+        price_ = bondPrice().mul( uint( assetPrice() ) ).mul( 1e6 );
     }
 
 
@@ -1034,15 +1059,11 @@ contract DomeBondDepository is Ownable {
     }
 
     /**
-     *  @notice debt ratio in same terms for reserve or liquidity bonds
+     *  @notice debt ratio in same terms as reserve bonds
      *  @return uint
      */
     function standardizedDebtRatio() external view returns ( uint ) {
-        if ( isLiquidityBond ) {
-            return debtRatio().mul( IBondCalculator( bondCalculator ).markdown( principle ) ).div( 1e9 );
-        } else {
-            return debtRatio();
-        }
+        return debtRatio().mul( uint( assetPrice() ) ).div( 1e8 ); // FTM feed is 8 decimals
     }
 
     /**
@@ -1098,13 +1119,24 @@ contract DomeBondDepository is Ownable {
             pendingPayout_ = payout.mul( percentVested ).div( 10000 );
         }
     }
-    
+
     /**
      *  @notice show the name of current bond
      *  @return _name string
      */
     function name() public view returns (string memory _name) {
         return name_;
+    }
+
+    /**
+     *  @notice return percentage of total principle value over total reserve
+     *  @param _amount uint
+     *  @return uint
+     */
+    function principlePercentAfterPurchase(uint _amount) public view returns (uint){
+        return IERC20(principle).balanceOf(treasury).add(_amount).mul(uint(assetPrice()))
+        .div(10**(uint(IERC20(principle).decimals()).sub(5)))
+        .div(ITreasury(treasury).totalReserves());
     }
 
 

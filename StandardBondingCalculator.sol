@@ -275,10 +275,13 @@ contract DomeBondingCalculator is IBondingCalculator {
     function getKValue( address _pair ) public view returns( uint k_ ) {
         uint token0 = IERC20( IUniswapV2Pair( _pair ).token0() ).decimals();
         uint token1 = IERC20( IUniswapV2Pair( _pair ).token1() ).decimals();
-        uint decimals = token0.add( token1 ).sub( IERC20( _pair ).decimals() );
-
+        uint decimals = token0.add( token1 );
+        uint pair = IERC20( _pair ).decimals();
         (uint reserve0, uint reserve1, ) = IUniswapV2Pair( _pair ).getReserves();
-        k_ = reserve0.mul(reserve1).div( 10 ** decimals );
+        if(decimals>=pair)
+            k_ = reserve0.mul(reserve1).div( 10 ** decimals.sub(pair) );
+        else
+            k_ = reserve0.mul(reserve1).mul( 10 ** pair.sub(decimals) );
     }
 
     function getTotalValue( address _pair ) public view returns ( uint _value ) {

@@ -585,8 +585,8 @@ library FixedPoint {
 }
 
 interface ITreasury {
-    function deposit( uint _amount, address _token, uint _profit ) external returns ( bool );
-    function tokenValue( address _token, uint _amount ) external view returns ( uint value_ );
+    function deposit( uint _amount, address _token, uint _profit ) external returns ( uint send_ );
+    function valueOf( address _token, uint _amount ) external view returns ( uint value_ );
 }
 
 interface IBondCalculator {
@@ -596,13 +596,15 @@ interface IBondCalculator {
 
 interface IStaking {
     function stake( uint _amount, address _recipient ) external returns ( bool );
+    function claim( address _recipient ) external;
 }
 
-interface IStakingHelper {
-    function stake( uint _amount, address _recipient ) external;
+interface IsDOME {
+    function gonsForBalance( uint amount ) external view returns ( uint );
+    function balanceForGons( uint gons ) external view returns ( uint );
 }
 
-contract DomeBondDepository is Ownable {
+contract DomeBondStakeDepository is Ownable {
 
     using FixedPoint for *;
     using SafeERC20 for IERC20;
@@ -623,7 +625,8 @@ contract DomeBondDepository is Ownable {
 
     /* ======== STATE VARIABLES ======== */
 
-    address public immutable DOME; // token given as payment for bond
+    address public immutable DOME; // intermediate reward token from treasury
+    address public immutable sDOME; // token given as payment for bond
     address public immutable principle; // token used to create bond
     address public immutable treasury; // mints DOME when receives principle
     address public immutable DAO; // receives profit share from bond
@@ -631,20 +634,18 @@ contract DomeBondDepository is Ownable {
     bool public immutable isLiquidityBond; // LP and Reserve bonds are treated slightly different
     address public immutable bondCalculator; // calculates value of LP tokens
 
-    address public staking; // to auto-stake payout
-    address public stakingHelper; // to stake and claim if no staking warmup
-    bool public useHelper;
+    address public staking; // to stake and claim if no staking warmup
 
     Terms public terms; // stores terms for new bonds
     Adjust public adjustment; // stores adjustment to BCV data
 
-    mapping( address => Bond ) public bondInfo; // stores bond information for depositors
+    mapping( address => Bond ) public _bondInfo; // stores bond information for depositors
 
     uint public totalDebt; // total value of outstanding bonds; used for pricing
     uint public lastDecay; // reference block for debt decay
-
-    uint public totalPrinciple; // total principle bonded through this depository
     
+    uint public totalPrinciple; // total principle bonded through this depository
+
     string internal name_; //name of this bond
 
 
@@ -660,9 +661,10 @@ contract DomeBondDepository is Ownable {
         uint maxDebt; // 9 decimal debt ratio, max % total supply created as debt
     }
 
-    // Info for bond holder
+    // Info for bond holder with gons
     struct Bond {
-        uint payout; // DOME remaining to be paid
+        uint gonsPayout; // sDOME gons remaining to be paid
+        uint domePayout; //DOME amount at the moment of bond
         uint vesting; // Blocks left to vest
         uint lastBlock; // Last interaction
         uint pricePaid; // In DAI, for front end viewing
@@ -685,6 +687,7 @@ contract DomeBondDepository is Ownable {
     constructor ( 
         string memory _name,
         address _DOME,
+        address _sDOME,
         address _principle,
         address _treasury, 
         address _DAO, 
@@ -692,6 +695,8 @@ contract DomeBondDepository is Ownable {
     ) {
         require( _DOME != address(0) );
         DOME = _DOME;
+        require( _sDOME != address(0) );
+        sDOME = _sDOME;
         require( _principle != address(0) );
         principle = _principle;
         require( _treasury != address(0) );
@@ -748,7 +753,7 @@ contract DomeBondDepository is Ownable {
      */
     function setBondTerms ( PARAMETER _parameter, uint _input ) external onlyPolicy() {
         if ( _parameter == PARAMETER.VESTING ) { // 0
-            require( _input >= 10000, "Vesting must be longer than 36 hours" );
+            require( _input >= 10000, "Vesting must be longer than 3 hours" );
             terms.vestingTerm = _input;
         } else if ( _parameter == PARAMETER.PAYOUT ) { // 1
             require( _input <= 1000, "Payout cannot be above 1 percent" );
@@ -770,7 +775,7 @@ contract DomeBondDepository is Ownable {
      *  @param _target uint
      *  @param _buffer uint
      */
-    function setAdjustment ( 
+    function setAdjustment (
         bool _addition,
         uint _increment, 
         uint _target,
@@ -788,17 +793,11 @@ contract DomeBondDepository is Ownable {
     /**
      *  @notice set contract for auto stake
      *  @param _staking address
-     *  @param _helper bool
+     *  @param _helper for compatibility 
      */
-    function setStaking( address _staking, bool _helper ) external onlyPolicy() {
+    function setStaking( address _staking, bool _helper) external onlyPolicy() {
         require( _staking != address(0) );
-        if ( _helper ) {
-            useHelper = true;
-            stakingHelper = _staking;
-        } else {
-            useHelper = false;
-            staking = _staking;
-        }
+        staking = _staking;
     }
 
 
@@ -824,11 +823,11 @@ contract DomeBondDepository is Ownable {
         require( totalDebt <= terms.maxDebt, "Max capacity reached" );
         
         uint priceInUSD = bondPriceInUSD(); // Stored in bond info
-        uint nativePrice = _bondPrice();
+        //uint nativePrice = _bondPrice();
 
-        require( _maxPrice >= nativePrice, "Slippage limit: more than max price" ); // slippage protection
+        require( _maxPrice >= _bondPrice(), "Slippage limit: more than max price" ); // slippage protection
 
-        uint value = ITreasury( treasury ).tokenValue( principle, _amount );
+        uint value = ITreasury( treasury ).valueOf( principle, _amount );
         uint payout = payoutFor( value ); // payout to bonder is computed
 
         require( payout >= 10000000, "Bond too small" ); // must be > 0.01 DOME ( underflow protection )
@@ -855,10 +854,16 @@ contract DomeBondDepository is Ownable {
         
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
-                
+
+        IERC20( DOME ).approve( staking, payout );
+        IStaking( staking ).stake( payout, address(this) );
+        IStaking( staking ).claim( address(this) );
+        uint stakeGons=IsDOME(sDOME).gonsForBalance(payout);
+
         // depositor info is stored
-        bondInfo[ _depositor ] = Bond({ 
-            payout: bondInfo[ _depositor ].payout.add( payout ),
+        _bondInfo[ _depositor ] = Bond({ 
+            gonsPayout: _bondInfo[ _depositor ].gonsPayout.add( stakeGons ),
+            domePayout: _bondInfo[ _depositor ].domePayout.add( payout ),
             vesting: terms.vestingTerm,
             lastBlock: block.number,
             pricePaid: priceInUSD
@@ -873,62 +878,27 @@ contract DomeBondDepository is Ownable {
     }
 
     /** 
-     *  @notice redeem bond for user
+     *  @notice redeem bond for user, keep the parameter bool _stake for compatibility of redeem helper
      *  @param _recipient address
      *  @param _stake bool
      *  @return uint
      */ 
-    function redeem( address _recipient, bool _stake ) external returns ( uint ) {        
-        Bond memory info = bondInfo[ _recipient ];
+    function redeem( address _recipient, bool _stake) external returns ( uint ) {        
+        Bond memory info = _bondInfo[ _recipient ];
         uint percentVested = percentVestedFor( _recipient ); // (blocks since last interaction / vesting term remaining)
 
-        if ( percentVested >= 10000 ) { // if fully vested
-            delete bondInfo[ _recipient ]; // delete user info
-            emit BondRedeemed( _recipient, info.payout, 0 ); // emit bond data
-            return stakeOrSend( _recipient, _stake, info.payout ); // pay user everything due
-
-        } else { // if unfinished
-            // calculate payout vested
-            uint payout = info.payout.mul( percentVested ).div( 10000 );
-
-            // store updated deposit info
-            bondInfo[ _recipient ] = Bond({
-                payout: info.payout.sub( payout ),
-                vesting: info.vesting.sub( block.number.sub( info.lastBlock ) ),
-                lastBlock: block.number,
-                pricePaid: info.pricePaid
-            });
-
-            emit BondRedeemed( _recipient, payout, bondInfo[ _recipient ].payout );
-            return stakeOrSend( _recipient, _stake, payout );
-        }
+        require ( percentVested >= 10000 ,"not yet fully vested") ; // if fully vested
+        delete _bondInfo[ _recipient ]; // delete user info
+        uint _amount = IsDOME(sDOME).balanceForGons(info.gonsPayout);
+        emit BondRedeemed( _recipient, _amount, 0 ); // emit bond data
+        IERC20( sDOME ).transfer( _recipient, _amount ); // pay user everything due
+        return _amount;
     }
 
 
 
     
     /* ======== INTERNAL HELPER FUNCTIONS ======== */
-
-    /**
-     *  @notice allow user to stake payout automatically
-     *  @param _stake bool
-     *  @param _amount uint
-     *  @return uint
-     */
-    function stakeOrSend( address _recipient, bool _stake, uint _amount ) internal returns ( uint ) {
-        if ( !_stake ) { // if user does not want to stake
-            IERC20( DOME ).transfer( _recipient, _amount ); // send payout
-        } else { // if user wants to stake
-            if ( useHelper ) { // use if staking warmup is 0
-                IERC20( DOME ).approve( stakingHelper, _amount );
-                IStakingHelper( stakingHelper ).stake( _amount, _recipient );
-            } else {
-                IERC20( DOME ).approve( staking, _amount );
-                IStaking( staking ).stake( _amount, _recipient );
-            }
-        }
-        return _amount;
-    }
 
     /**
      *  @notice makes incremental adjustment to control variable
@@ -1019,6 +989,22 @@ contract DomeBondDepository is Ownable {
             price_ = bondPrice().mul( 10 ** IERC20( principle ).decimals() ).div( 100 );
         }
     }
+    
+    /**
+     *  @notice return bond info with latest sDOME balance calculated from gons
+     *  @param _depositor address
+     *  @return payout uint
+     *  @return vesting uint
+     *  @return lastBlock uint
+     *  @return pricePaid uint
+     */
+    function bondInfo(address _depositor) public view returns ( uint payout,uint vesting,uint lastBlock,uint pricePaid ) {
+        Bond memory info = _bondInfo[ _depositor ];
+        payout=IsDOME(sDOME).balanceForGons(info.gonsPayout);
+        vesting=info.vesting;
+        lastBlock=info.lastBlock;
+        pricePaid=info.pricePaid;
+    }
 
 
     /**
@@ -1072,7 +1058,7 @@ contract DomeBondDepository is Ownable {
      *  @return percentVested_ uint
      */
     function percentVestedFor( address _depositor ) public view returns ( uint percentVested_ ) {
-        Bond memory bond = bondInfo[ _depositor ];
+        Bond memory bond = _bondInfo[ _depositor ];
         uint blocksSinceLast = block.number.sub( bond.lastBlock );
         uint vesting = bond.vesting;
 
@@ -1090,12 +1076,12 @@ contract DomeBondDepository is Ownable {
      */
     function pendingPayoutFor( address _depositor ) external view returns ( uint pendingPayout_ ) {
         uint percentVested = percentVestedFor( _depositor );
-        uint payout = bondInfo[ _depositor ].payout;
+        uint payout = IsDOME(sDOME).balanceForGons(_bondInfo[ _depositor ].gonsPayout);
 
         if ( percentVested >= 10000 ) {
             pendingPayout_ = payout;
         } else {
-            pendingPayout_ = payout.mul( percentVested ).div( 10000 );
+            pendingPayout_ = 0;
         }
     }
     
@@ -1109,6 +1095,7 @@ contract DomeBondDepository is Ownable {
 
 
 
+
     /* ======= AUXILLIARY ======= */
 
     /**
@@ -1117,6 +1104,7 @@ contract DomeBondDepository is Ownable {
      */
     function recoverLostToken( address _token ) external returns ( bool ) {
         require( _token != DOME );
+        require( _token != sDOME );
         require( _token != principle );
         IERC20( _token ).safeTransfer( DAO, IERC20( _token ).balanceOf( address(this) ) );
         return true;

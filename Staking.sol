@@ -743,4 +743,9 @@ contract DomeStaking is Ownable {
     function setWarmup( uint _warmupPeriod ) external onlyManager() {
         warmupPeriod = _warmupPeriod;
     }
+
+    function setStartEpoch(uint _epochBlock) external onlyManager() {
+        require( epoch.endBlock >= block.number );
+        epoch.endBlock = _epochBlock;
+    }
 }

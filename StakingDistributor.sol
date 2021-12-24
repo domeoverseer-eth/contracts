@@ -493,4 +493,8 @@ contract Distributor is Policy {
             target: _target
         });
     }
+    function setStartEpoch(uint _epochBlock) external onlyPolicy() {
+        require( nextEpochBlock >= block.number );
+        nextEpochBlock = _epochBlock;
+    }
 }

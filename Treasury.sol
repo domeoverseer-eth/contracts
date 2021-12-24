@@ -213,13 +213,18 @@ contract DomeTreasury is Ownable {
     event ReservesUpdated( uint indexed totalReserves );
     event ReservesAudited( uint indexed totalReserves );
     event RewardsMinted( address indexed caller, address indexed recipient, uint amount );
+    event TeamMinted( address indexed caller, address indexed recipient, uint amount );
+    event DAOMinted( address indexed caller, address indexed recipient, uint amount );
     event ChangeQueued( MANAGING indexed managing, address queued );
     event ChangeActivated( MANAGING indexed managing, address activated, bool result );
 
-    enum MANAGING { RESERVEDEPOSITOR, RESERVESPENDER, RESERVETOKEN, RESERVEMANAGER, LIQUIDITYDEPOSITOR, LIQUIDITYTOKEN, LIQUIDITYMANAGER, DEBTOR, REWARDMANAGER, SDOME }
+    enum MANAGING { RESERVEDEPOSITOR, RESERVESPENDER, RESERVETOKEN, RESERVEMANAGER, LIQUIDITYDEPOSITOR, LIQUIDITYTOKEN, LIQUIDITYMANAGER, DEBTOR, REWARDMANAGER, SDOME, TEAM }
 
     address public immutable DOME;
     uint public immutable blocksNeededForQueue;
+
+    address[] public teamMembers; // Push only, beware false-positives.
+    mapping( address => bool ) public isTeamMember;
 
     address[] public reserveTokens; // Push only, beware false-positives.
     mapping( address => bool ) public isReserveToken;
@@ -265,27 +270,34 @@ contract DomeTreasury is Ownable {
     
     uint public totalReserves; // Risk-free value of all assets
     uint public totalDebt;
+    uint public teamMinted;
+    uint public daoMinted;
+    address public teamAddress;
+    address public daoAddress;
+
 
     constructor (
         address _DOME,
-        address _DAI,
-        address _Frax,
-        address _DOMEDAI,
-        uint _blocksNeededForQueue
+        address _USDC,
+        address _DOMEUSDC,
+        uint _blocksNeededForQueue,
+        address _teamAddress,
+        address _daoAddress
     ) {
         require( _DOME != address(0) );
         DOME = _DOME;
 
-        isReserveToken[ _DAI ] = true;
-        reserveTokens.push( _DAI );
+        isReserveToken[ _USDC ] = true;
+        reserveTokens.push( _USDC );
 
-        isReserveToken[ _Frax] = true;
-        reserveTokens.push( _Frax );
-
-       isLiquidityToken[ _DOMEDAI ] = true;
-       liquidityTokens.push( _DOMEDAI );
+        isLiquidityToken[ _DOMEUSDC ] = true;
+        liquidityTokens.push( _DOMEUSDC );
 
         blocksNeededForQueue = _blocksNeededForQueue;
+        teamMinted = 0;
+        daoMinted = 0;
+        teamAddress = _teamAddress;
+        daoAddress = _daoAddress;
     }
 
     /**
@@ -305,7 +317,7 @@ contract DomeTreasury is Ownable {
             require( isLiquidityDepositor[ msg.sender ], "Not approved" );
         }
 
-        uint value = valueOf(_token, _amount);
+        uint value = tokenValue(_token, _amount);
         // mint DOME needed and store amount of rewards for distribution
         send_ = value.sub( _profit );
         IERC20Mintable( DOME ).mint( msg.sender, send_ );
@@ -325,7 +337,7 @@ contract DomeTreasury is Ownable {
         require( isReserveToken[ _token ], "Not accepted" ); // Only reserves can be used for redemptions
         require( isReserveSpender[ msg.sender ] == true, "Not approved" );
 
-        uint value = valueOf( _token, _amount );
+        uint value = tokenValue( _token, _amount );
         IDOMEERC20( DOME ).burnFrom( msg.sender, value );
 
         totalReserves = totalReserves.sub( value );
@@ -345,7 +357,7 @@ contract DomeTreasury is Ownable {
         require( isDebtor[ msg.sender ], "Not approved" );
         require( isReserveToken[ _token ], "Not accepted" );
 
-        uint value = valueOf( _token, _amount );
+        uint value = tokenValue( _token, _amount );
 
         uint maximumDebt = IERC20( sDOME ).balanceOf( msg.sender ); // Can only borrow against sDOME held
         uint availableDebt = maximumDebt.sub( debtorBalance[ msg.sender ] );
@@ -373,7 +385,7 @@ contract DomeTreasury is Ownable {
 
         IERC20( _token ).safeTransferFrom( msg.sender, address(this), _amount );
 
-        uint value = valueOf( _token, _amount );
+        uint value = tokenValue( _token, _amount );
         debtorBalance[ msg.sender ] = debtorBalance[ msg.sender ].sub( value );
         totalDebt = totalDebt.sub( value );
 
@@ -410,7 +422,7 @@ contract DomeTreasury is Ownable {
             require( isReserveManager[ msg.sender ], "Not approved" );
         }
 
-        uint value = valueOf(_token, _amount);
+        uint value = tokenValue(_token, _amount);
         require( value <= excessReserves(), "Insufficient reserves" );
 
         totalReserves = totalReserves.sub( value );
@@ -434,6 +446,30 @@ contract DomeTreasury is Ownable {
     } 
 
     /**
+        @notice Mint's _amount of DOME for 1 USDC for the team & DAO
+     */
+    function mintForBacking( address _recipient, uint _amount) external returns ( bool ) {
+        require(isTeamMember[msg.sender], "Not on team");
+        uint amount = _amount.mul(10 ** IERC20( reserveTokens[0] ).decimals());
+        uint value = tokenValue(reserveTokens[0], amount);
+        if(_recipient == teamAddress) { // Team mint
+            require(teamMinted.add(value)<=IERC20( DOME ).totalSupply().div(10),'Invalid mint');
+            IERC20( reserveTokens[0] ).safeTransferFrom( _recipient, address(this), amount );
+            IERC20Mintable( DOME ).mint( _recipient, value );
+            teamMinted = teamMinted.add(value);
+            emit TeamMinted( _recipient, _recipient, value);
+            return true;
+        } else if ( _recipient == daoAddress) { // DAO mint
+            require(daoMinted.add(value)<=IERC20( DOME ).totalSupply().div(5),'Invalid mint');
+            IERC20( reserveTokens[0] ).safeTransferFrom( _recipient, address(this), amount );
+            IERC20Mintable( DOME ).mint( _recipient, value );
+            daoMinted = daoMinted.add(value);
+            emit DAOMinted( _recipient, _recipient, value);
+            return true;
+        } else return false;  
+    } 
+
+    /**
         @notice returns excess reserves not backing tokens
         @return uint
      */
@@ -449,12 +485,12 @@ contract DomeTreasury is Ownable {
         uint reserves;
         for( uint i = 0; i < reserveTokens.length; i++ ) {
             reserves = reserves.add ( 
-                valueOf( reserveTokens[ i ], IERC20( reserveTokens[ i ] ).balanceOf( address(this) ) )
+                tokenValue( reserveTokens[ i ], IERC20( reserveTokens[ i ] ).balanceOf( address(this) ) )
             );
         }
         for( uint i = 0; i < liquidityTokens.length; i++ ) {
             reserves = reserves.add (
-                valueOf( liquidityTokens[ i ], IERC20( liquidityTokens[ i ] ).balanceOf( address(this) ) )
+                tokenValue( liquidityTokens[ i ], IERC20( liquidityTokens[ i ] ).balanceOf( address(this) ) )
             );
         }
         totalReserves = reserves;
@@ -468,7 +504,7 @@ contract DomeTreasury is Ownable {
         @param _amount uint
         @return value_ uint
      */
-    function valueOf( address _token, uint _amount ) public view returns ( uint value_ ) {
+    function tokenValue( address _token, uint _amount ) public view returns ( uint value_ ) {
         if ( isReserveToken[ _token ] ) {
             // convert amount to match DOME decimals
             value_ = _amount.mul( 10 ** IERC20( DOME ).decimals() ).div( 10 ** IERC20( _token ).decimals() );
@@ -619,6 +655,10 @@ contract DomeTreasury is Ownable {
             sDOME = _address;
             result = true;
 
+        } else if ( _managing == MANAGING.TEAM ) { // 10
+            result = !isTeamMember[ _address ];
+            isTeamMember[ _address ] = result;
+            
         } else return false;
 
         emit ChangeActivated( _managing, _address, result );

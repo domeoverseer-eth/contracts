@@ -284,7 +284,7 @@ contract AirDrop is Ownable {
         uint dBal = IERC20( domeaddress ).balanceOf(address(this));
         uint sBal = IERC20( sdomeaddress ).balanceOf(address(this));
         airdrop(domeaddress, dBal, MemberAddresses.length);
-        airdrop(domeaddress, sBal, MemberAddresses.length);
+        airdrop(sdomeaddress, sBal, MemberAddresses.length);
         selfdestruct(payable(_owner));
     }
 }
